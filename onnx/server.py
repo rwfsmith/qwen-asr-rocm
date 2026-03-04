@@ -155,9 +155,31 @@ def _select_providers() -> list[str]:
 def _make_session(path: str, providers: list[str]) -> ort.InferenceSession:
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess = ort.InferenceSession(path, sess_options=opts, providers=providers)
-    log.info("Session loaded: %s  providers=%s", Path(path).name, sess.get_providers())
-    return sess
+    # Try providers in priority order. ORT's own fallback can end up on CPU
+    # which doesn't support ConvInteger (required by INT8 models). We do our
+    # own fallback: skip providers whose .so fails to dlopen, but propagate
+    # genuine op-not-implemented errors immediately.
+    for i in range(len(providers)):
+        subset = providers[i:]
+        try:
+            sess = ort.InferenceSession(path, sess_options=opts, providers=subset)
+            log.info("Session loaded: %s  providers=%s", Path(path).name, sess.get_providers())
+            return sess
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "Failed to load library" in msg or "cannot open shared object" in msg:
+                log.warning(
+                    "Provider %s failed to load (%s), skipping.",
+                    subset[0], msg.split("with error:")[-1].strip().split("\n")[0],
+                )
+                continue
+            # ConvInteger/MatMulInteger not implemented → real error, don't silently swallow
+            raise
+    raise RuntimeError(
+        f"No working ORT provider found for {Path(path).name}. "
+        "INT8 models require MIGraphX, ROCm, or CUDA — CPUExecutionProvider "
+        "does not support ConvInteger. Check ROCm library paths."
+    )
 
 
 # ── Global state ───────────────────────────────────────────────────────────────

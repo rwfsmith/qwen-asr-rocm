@@ -41,24 +41,31 @@ RUN python3.12 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # ── ROCm system libraries (ROCm build only) ───────────────────────────────────
-# migraphx provides the MIGraphX execution provider for onnxruntime-rocm.
-# amdsmi is required by onnxruntime-rocm's device detection at import time.
+# migraphx provides the MIGraphX execution provider for onnxruntime-migraphx.
+# amdsmi is required by onnxruntime for ROCm device detection at import time.
+# Bake /opt/rocm/lib into ldconfig so provider .so files can find ROCm libs
+# (libamdhip64.so.6, libhipblas.so.2, etc.) without LD_LIBRARY_PATH at runtime.
 ARG GPU_SUPPORT
 RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
         apt-get update && apt-get install -y --no-install-recommends \
             migraphx \
         && apt-get clean && rm -rf /var/lib/apt/lists/* && \
         echo "==> Installing amdsmi from system ROCm..." && \
-        pip install --no-cache-dir /opt/rocm/share/amd_smi/; \
+        pip install --no-cache-dir /opt/rocm/share/amd_smi/ && \
+        echo "==> Baking ROCm lib paths into ldconfig..." && \
+        echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && \
+        echo "/opt/rocm/lib64" >> /etc/ld.so.conf.d/rocm.conf && \
+        ldconfig; \
     fi
 
-# ── onnxruntime: ROCm build (MIGraphX EP) or CPU fallback ─────────────────────
-# onnxruntime-rocm ships MIGraphXExecutionProvider.
+# ── onnxruntime: MIGraphX build (ROCm) or CPU fallback ────────────────────────
+# onnxruntime-migraphx replaces the deprecated onnxruntime-rocm package.
+# It ships MIGraphXExecutionProvider and ROCMExecutionProvider.
 # It conflicts with the plain onnxruntime wheel — only one may be installed.
 ARG GPU_SUPPORT
 RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
-        echo "==> Installing onnxruntime-rocm..." && \
-        pip install --no-cache-dir onnxruntime-rocm \
+        echo "==> Installing onnxruntime-migraphx..." && \
+        pip install --no-cache-dir onnxruntime-migraphx \
             --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1150/; \
     else \
         echo "==> CPU build: installing onnxruntime..." && \
