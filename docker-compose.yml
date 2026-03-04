@@ -1,83 +1,13 @@
 name: qwen-asr-rocm
 
+# NOTE: vLLM backend is disabled — Triton attention kernels crash the ROCm
+# driver on gfx1150 during encoder-cache profiling.  The ONNX/MIGraphX path
+# uses a different execution engine that works on gfx1150.
+# The vLLM Dockerfile and entrypoint are kept in the repo for future use.
+
 services:
+  # ── ONNX / MIGraphX backend ────────────────────────────────────────────────
   qwen-asr:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        GPU_SUPPORT: "${GPU_SUPPORT:-rocm}"
-
-    container_name: qwen-asr-rocm
-    # SAFETY: use 'no' until startup is stable — 'unless-stopped' with a
-    # crashing ROCm init loop can destabilise the KFD kernel module.
-    restart: "no"
-
-    user: root
-    shm_size: 4gb   # vLLM uses /dev/shm for multiprocessing worker communication
-
-    ports:
-      - "8000:8000"
-
-    # --- AMD GPU passthrough ---
-    devices:
-      - /dev/dri
-      - /dev/kfd
-
-    group_add:
-      - "${VIDEO_GID:-44}"
-      - "${RENDER_GID:-109}"
-
-    environment:
-      - PYTHONUNBUFFERED=1
-      - PYTHONFAULTHANDLER=1
-      - MODEL_NAME=${MODEL_NAME:-Qwen/Qwen3-ASR-0.6B}
-      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.7}
-      - MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
-      # MIOpen kernel tuning — see kokoro-rocm notes
-      - MIOPEN_FIND_MODE=3
-      - MIOPEN_FIND_ENFORCE=3
-      # HIP/ROCm segfaults when initialised a second time in a child process
-      # (gfx1150).  Disable V1 multi-processing so EngineCore runs in the
-      # same process as APIServer — no child subprocess, no second HIP init.
-      - VLLM_ENABLE_V1_MULTIPROCESSING=0
-      # Debug logging — remove once stable.
-      - VLLM_LOGGING_LEVEL=DEBUG
-
-    volumes:
-      - ${QWEN_ASR_DATA_DIR:-./data}/models:/app/models
-      - ${QWEN_ASR_DATA_DIR:-./data}/miopen-cache:/root/.cache/miopen
-      - ${QWEN_ASR_DATA_DIR:-./data}/hf-cache:/root/.cache/huggingface
-
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/v1/models"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 600s
-
-  qwen-asr-wyoming:
-    build:
-      context: ./wyoming
-      dockerfile: Dockerfile
-
-    container_name: qwen-asr-wyoming
-    restart: unless-stopped
-
-    ports:
-      - "10300:10300"
-
-    depends_on:
-      qwen-asr:
-        condition: service_healthy
-
-    command: >
-      --asr-url http://qwen-asr:8000
-      --model ${MODEL_NAME:-Qwen/Qwen3-ASR-0.6B}
-      --language ${ASR_LANGUAGE:-}
-
-  # ── ONNX / MIGraphX backend (for benchmarking against vLLM) ────────────────
-  qwen-asr-onnx:
     build:
       context: ./onnx
       dockerfile: Dockerfile
@@ -116,22 +46,22 @@ services:
       retries: 5
       start_period: 60s
 
-  qwen-asr-onnx-wyoming:
+  qwen-asr-wyoming:
     build:
       context: ./wyoming
       dockerfile: Dockerfile
 
-    container_name: qwen-asr-onnx-wyoming
+    container_name: qwen-asr-wyoming
     restart: unless-stopped
 
     ports:
-      - "10301:10300"
+      - "10300:10300"
 
     depends_on:
-      qwen-asr-onnx:
+      qwen-asr:
         condition: service_healthy
 
     command: >
-      --asr-url http://qwen-asr-onnx:8001
+      --asr-url http://qwen-asr:8001
       --model ${ONNX_MODEL_NAME:-andrewleech/qwen3-asr-0.6b-onnx-int8}
       --language ${ASR_LANGUAGE:-}

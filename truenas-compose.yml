@@ -1,4 +1,4 @@
-# truenas-compose.yml – Qwen3-ASR vLLM API + Wyoming proxy for TrueNAS SCALE
+# truenas-compose.yml – Qwen3-ASR ONNX API + Wyoming proxy for TrueNAS SCALE
 #
 # Run from TrueNAS shell (System Settings → Shell or SSH):
 #
@@ -10,99 +10,28 @@
 #   export VIDEO_GID=$(getent group video | cut -d: -f3)
 #   export RENDER_GID=$(getent group render | cut -d: -f3)
 #   export QWEN_ASR_DATA_DIR=/mnt/tank/apps/qwen-asr/data
-#   sudo -E mkdir -p "$QWEN_ASR_DATA_DIR"/{models,miopen-cache,hf-cache}
+#   sudo -E mkdir -p "$QWEN_ASR_DATA_DIR"/{models,hf-cache}
 #   docker compose -f truenas-compose.yml up -d --build
 #
-# The model (Qwen3-ASR-0.6B, ~1.2 GB) is downloaded on first start if
+# The model (~600 MB ONNX int8) is downloaded on first start if
 # not already in the cache volume.
 #
 # Add to Home Assistant:
 #   Settings → Devices & Services → Add Integration → Wyoming Protocol
 #   Host: <truenas-ip>   Port: 10300
+#
+# NOTE: vLLM backend is disabled — Triton attention kernels crash the ROCm
+# driver on gfx1150 during encoder-cache profiling.  The ONNX/MIGraphX path
+# uses a different execution engine that works on gfx1150.
+# The vLLM Dockerfile and entrypoint are kept in the repo for future use.
 
 name: qwen-asr-rocm
 
 x-data-dir: &data-dir ${QWEN_ASR_DATA_DIR:-./data}
 
 services:
+  # ── ONNX / MIGraphX backend ────────────────────────────────────────────────
   qwen-asr:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        GPU_SUPPORT: "rocm"
-
-    container_name: qwen-asr-rocm
-    # SAFETY: use 'no' until startup is stable — 'unless-stopped' with a
-    # crashing ROCm init loop can destabilise the KFD kernel module.
-    restart: "no"
-
-    user: root
-    shm_size: 4gb   # vLLM uses /dev/shm for multiprocessing worker communication
-
-    ports:
-      - "8000:8000"
-
-    # --- AMD GPU passthrough ---
-    devices:
-      - /dev/dri
-      - /dev/kfd
-
-    group_add:
-      - "${VIDEO_GID:-44}"
-      - "${RENDER_GID:-109}"
-
-    environment:
-      - PYTHONUNBUFFERED=1
-      - PYTHONFAULTHANDLER=1
-      - MODEL_NAME=Qwen/Qwen3-ASR-0.6B
-      - GPU_MEMORY_UTILIZATION=0.7
-      - MAX_NEW_TOKENS=1024
-      # MIOpen kernel tuning — exhaustive search on first run, caches to volume.
-      # After first successful startup, consider switching to MIOPEN_FIND_MODE=2.
-      - MIOPEN_FIND_MODE=3
-      - MIOPEN_FIND_ENFORCE=3
-      # HIP/ROCm segfaults when initialised a second time in a child process
-      # (gfx1150).  Disable V1 multi-processing so EngineCore runs in the
-      # same process as APIServer — no child subprocess, no second HIP init.
-      - VLLM_ENABLE_V1_MULTIPROCESSING=0
-      # Debug logging — remove once stable.
-      - VLLM_LOGGING_LEVEL=DEBUG
-
-    volumes:
-      - ${QWEN_ASR_DATA_DIR:-./data}/models:/app/models
-      - ${QWEN_ASR_DATA_DIR:-./data}/miopen-cache:/root/.cache/miopen
-      - ${QWEN_ASR_DATA_DIR:-./data}/hf-cache:/root/.cache/huggingface
-
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/v1/models"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 600s
-
-  qwen-asr-wyoming:
-    build:
-      context: ./wyoming
-      dockerfile: Dockerfile
-
-    container_name: qwen-asr-wyoming
-    restart: unless-stopped
-
-    ports:
-      - "10300:10300"
-
-    depends_on:
-      qwen-asr:
-        condition: service_healthy
-
-    command: >
-      --asr-url http://qwen-asr:8000
-      --model Qwen/Qwen3-ASR-0.6B
-
-  # ── ONNX / MIGraphX backend (for benchmarking against vLLM) ────────────────
-  # Wyoming port 10301 — add a second Wyoming integration in HA to compare.
-  qwen-asr-onnx:
     build:
       context: ./onnx
       dockerfile: Dockerfile
@@ -141,21 +70,21 @@ services:
       retries: 5
       start_period: 60s
 
-  qwen-asr-onnx-wyoming:
+  qwen-asr-wyoming:
     build:
       context: ./wyoming
       dockerfile: Dockerfile
 
-    container_name: qwen-asr-onnx-wyoming
+    container_name: qwen-asr-wyoming
     restart: unless-stopped
 
     ports:
-      - "10301:10300"
+      - "10300:10300"
 
     depends_on:
-      qwen-asr-onnx:
+      qwen-asr:
         condition: service_healthy
 
     command: >
-      --asr-url http://qwen-asr-onnx:8001
+      --asr-url http://qwen-asr:8001
       --model andrewleech/qwen3-asr-0.6b-onnx-int8
