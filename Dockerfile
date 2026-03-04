@@ -22,6 +22,7 @@
 ARG GPU_SUPPORT=rocm
 ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:7.2-complete
 ARG VLLM_REF=main
+ARG ROCM_ARCH=gfx1150
 
 # Named base stages — Docker selects via FROM base-${GPU_SUPPORT}
 FROM ubuntu:24.04 AS base-cpu
@@ -101,6 +102,7 @@ RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
 # VLLM_REF selects the git ref (tag, branch, or commit) to build.
 ARG GPU_SUPPORT
 ARG VLLM_REF
+ARG ROCM_ARCH
 RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
         TORCH_VER=$(pip show torch | grep ^Version | cut -d' ' -f2) && \
         echo "==> Cloning vllm @ ${VLLM_REF} for ROCm source build..." && \
@@ -112,10 +114,14 @@ RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
         pip install --no-cache-dir -r "${ROCM_REQ}" \
             "torch==${TORCH_VER}" \
             --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1150/ && \
-        echo "==> Building vllm with VLLM_TARGET_DEVICE=rocm..." && \
+        echo "==> Building vllm with VLLM_TARGET_DEVICE=rocm (arch=${ROCM_ARCH})..." && \
+        ROCM_PATH=$(python -c "import rocm; import os; print(os.path.dirname(rocm.__file__))") && \
+        echo "==> Detected ROCM_PATH from pip package: ${ROCM_PATH}" && \
         VLLM_TARGET_DEVICE=rocm \
         MAX_JOBS=$(nproc) \
         SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 \
+        ROCM_PATH=${ROCM_PATH} \
+        PYTORCH_ROCM_ARCH=${ROCM_ARCH} \
             pip install --no-cache-dir --no-build-isolation . && \
         rm -rf /tmp/vllm; \
     else \
