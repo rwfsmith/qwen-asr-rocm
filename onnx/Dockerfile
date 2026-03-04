@@ -66,11 +66,10 @@ RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
     fi
 
 # ── Python inference stack ─────────────────────────────────────────────────────
-# optimum[onnxruntime] provides ORTModelForSpeechSeq2Seq which wraps the
-# ONNX encoder-decoder inference loop and handles generate() for us.
+# Use onnxruntime directly — optimum conflicts with the ROCm torch version.
+# transformers provides AutoProcessor (feature extractor + tokenizer).
 # librosa handles sample-rate conversion for non-16 kHz inputs.
 RUN pip install --no-cache-dir \
-        "optimum[onnxruntime]>=1.19" \
         "transformers>=4.45" \
         "huggingface_hub[cli]>=0.27" \
         "fastapi>=0.115" \
