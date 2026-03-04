@@ -95,16 +95,18 @@ RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
     fi
 
 # ── vLLM + qwen-asr: everything from PyPI ─────────────────────────────────────
-# vllm is installed from PyPI here. The ROCm torch already on PATH ensures the
-# PyPI vllm picks up the correct GPU libs at runtime rather than re-downloading
-# CUDA torch. qwen-asr is installed without [vllm] extra since vllm is already
-# present, avoiding any CUDA vllm being pulled as a dep.
-RUN pip install --no-cache-dir \
+# Pin torch to the exact ROCm version already installed so pip cannot upgrade it
+# to a CUDA wheel when resolving vllm's dependencies.
+RUN TORCH_VER=$(pip show torch | grep ^Version | cut -d' ' -f2) && \
+    echo "==> Pinning torch==${TORCH_VER} to block CUDA upgrade during vllm install..." && \
+    pip install --no-cache-dir \
+        "torch==${TORCH_VER}" \
         vllm \
         "qwen-asr>=0.0.6" \
         "huggingface_hub[cli]>=0.27" \
         "fastapi>=0.115" \
-        "uvicorn[standard]>=0.30"
+        "uvicorn[standard]>=0.30" \
+        --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1150/
 
 # ── App structure ─────────────────────────────────────────────────────────────
 RUN useradd -m -u 1001 appuser \
