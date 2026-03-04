@@ -139,6 +139,13 @@ RUN pip install --no-cache-dir \
         "fastapi>=0.115" \
         "uvicorn[standard]>=0.30"
 
+# ── Remove Ray (pulled in by vllm) ────────────────────────────────────────────
+# Ray is only needed for multi-node / multi-GPU distributed inference.
+# On single-GPU deployments it is unused, and its bundled pyamdsmi triggers a
+# Bus error (SIGBUS) on gfx1150 when it tries to enumerate AMD GPUs via
+# ctypes.LoadLibrary during import.  vLLM gracefully skips Ray when absent.
+RUN pip uninstall -y ray 2>/dev/null || true
+
 # ── Bake ROCm pip-package paths so torch can find HIP libs at runtime ─────────
 # rocm-sdk init sets up the SDK; we capture ROCM_PATH and write it to
 # /opt/venv/rocm-env.sh (sourced by entrypoint.sh) and to ld.so.conf.d so
