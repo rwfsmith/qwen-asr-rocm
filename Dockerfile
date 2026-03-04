@@ -21,7 +21,7 @@
 
 ARG GPU_SUPPORT=rocm
 ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:7.2-complete
-ARG VLLM_REF=main
+ARG VLLM_REF=v0.14.0
 ARG ROCM_ARCH=gfx1150
 
 # Named base stages — Docker selects via FROM base-${GPU_SUPPORT}
