@@ -158,7 +158,8 @@ ENV MODEL_DIR=/app/models \
     PORT=8000 \
     # Enable flash-attn AMD triton backend at runtime
     FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-    VLLM_USE_TRITON_FLASH_ATTN=1
+    VLLM_USE_TRITON_FLASH_ATTN=1 \
+    VLLM_TARGET_DEVICE=rocm
 
 EXPOSE 8000
 
