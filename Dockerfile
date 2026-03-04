@@ -137,6 +137,23 @@ RUN pip install --no-cache-dir \
         "fastapi>=0.115" \
         "uvicorn[standard]>=0.30"
 
+# ── Bake ROCm pip-package paths so torch can find HIP libs at runtime ─────────
+# rocm-sdk init sets up the SDK; we capture ROCM_PATH and write it to
+# /opt/venv/rocm-env.sh (sourced by entrypoint.sh) and to ld.so.conf.d so
+# the dynamic linker can resolve libamdhip64.so etc without an explicit
+# LD_LIBRARY_PATH export from the user.
+ARG GPU_SUPPORT
+RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
+        rocm-sdk init && \
+        ROCM_PATH=$(rocm-sdk path --root) && \
+        echo "==> Baking ROCM_PATH=${ROCM_PATH} into image..." && \
+        echo "${ROCM_PATH}/lib" > /etc/ld.so.conf.d/rocm-pip.conf && \
+        ldconfig && \
+        printf 'export ROCM_PATH="%s"\nexport LD_LIBRARY_PATH="%s/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"\nexport PATH="%s/bin:${PATH}"\n' \
+            "${ROCM_PATH}" "${ROCM_PATH}" "${ROCM_PATH}" > /opt/venv/rocm-env.sh && \
+        echo "==> /opt/venv/rocm-env.sh written:"; cat /opt/venv/rocm-env.sh; \
+    fi
+
 # ── App structure ─────────────────────────────────────────────────────────────
 RUN useradd -m -u 1001 appuser \
     && mkdir -p /app/models \

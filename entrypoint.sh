@@ -1,6 +1,14 @@
 #!/bin/sh
 set -e
 
+# ── Source ROCm SDK paths baked into the image at build time ──────────────────
+# The pip-installed ROCm package puts its libs under ROCM_PATH/lib; without
+# this, torch cannot find libamdhip64.so and fails device detection.
+if [ -f /opt/venv/rocm-env.sh ]; then
+    # shellcheck source=/dev/null
+    . /opt/venv/rocm-env.sh
+fi
+
 MODEL_DIR="${MODEL_DIR:-/app/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-ASR-0.6B}"
 MODEL_LOCAL="${MODEL_DIR}/$(echo "${MODEL_NAME}" | tr '/' '_')"
