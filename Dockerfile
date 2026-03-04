@@ -115,8 +115,9 @@ RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
             "torch==${TORCH_VER}" \
             --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1150/ && \
         echo "==> Building vllm with VLLM_TARGET_DEVICE=rocm (arch=${ROCM_ARCH})..." && \
-        ROCM_PATH=$(python -c "import rocm; import os; print(os.path.dirname(rocm.__file__))") && \
-        echo "==> Detected ROCM_PATH from pip package: ${ROCM_PATH}" && \
+        rocm-sdk init && \
+        ROCM_PATH=$(rocm-sdk path --root) && \
+        echo "==> Detected ROCM_PATH: ${ROCM_PATH}" && \
         VLLM_TARGET_DEVICE=rocm \
         MAX_JOBS=$(nproc) \
         SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 \
