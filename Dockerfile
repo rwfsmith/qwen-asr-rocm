@@ -77,10 +77,10 @@ RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
         echo "==> Installing torch from AMD gfx1150 staging..." && \
         pip install --no-cache-dir \
             --index-url https://rocm.nightlies.amd.com/v2-staging/gfx1150/ \
-            torch; \
+            torch torchaudio; \
     else \
-        echo "==> CPU build: installing torch from pytorch.org..." && \
-        pip install --no-cache-dir torch \
+        echo "==> CPU build: installing torch/torchaudio from pytorch.org..." && \
+        pip install --no-cache-dir torch torchaudio \
             --index-url https://download.pytorch.org/whl/cpu; \
     fi
 
