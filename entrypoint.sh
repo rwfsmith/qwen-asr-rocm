@@ -43,4 +43,5 @@ exec qwen-asr-serve "${MODEL_LOCAL}" \
     --port "${PORT}" \
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
     --max-model-len "${MAX_NEW_TOKENS}" \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --enforce-eager
