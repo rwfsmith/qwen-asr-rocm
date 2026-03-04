@@ -61,7 +61,9 @@ ARG GPU_SUPPORT
 RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
         echo "==> Installing system MIGraphX libraries via apt..." && \
         apt-get update && apt-get install -y --no-install-recommends migraphx && \
-        apt-get clean && rm -rf /var/lib/apt/lists/*; \
+        apt-get clean && rm -rf /var/lib/apt/lists/* && \
+        echo "==> Installing amdsmi Python bindings from system ROCm..." && \
+        pip install --no-cache-dir /opt/rocm/share/amd_smi/; \
     fi
 
 # ── PyTorch: staging index for ROCm, pytorch.org for CPU ──────────────────────
