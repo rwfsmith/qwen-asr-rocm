@@ -47,6 +47,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
         build-essential \
+        cmake \
+        ninja-build \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── Python virtual environment ─────────────────────────────────────────────────
@@ -113,7 +115,8 @@ RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
         echo "==> Building vllm with VLLM_TARGET_DEVICE=rocm..." && \
         VLLM_TARGET_DEVICE=rocm \
         MAX_JOBS=$(nproc) \
-            pip install --no-cache-dir --no-build-isolation -e . && \
+        SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 \
+            pip install --no-cache-dir --no-build-isolation . && \
         rm -rf /tmp/vllm; \
     else \
         echo "==> CPU build: installing vllm from PyPI..." && \
