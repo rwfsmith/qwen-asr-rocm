@@ -40,33 +40,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3.12 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# ── ROCm system libraries (ROCm build only) ───────────────────────────────────
-# migraphx provides the MIGraphX execution provider for onnxruntime-migraphx.
-# amdsmi is required by onnxruntime for ROCm device detection at import time.
-# Bake /opt/rocm/lib into ldconfig so provider .so files can find ROCm libs
-# (libamdhip64.so.6, libhipblas.so.2, etc.) without LD_LIBRARY_PATH at runtime.
+# ── ROCm libraries + onnxruntime-migraphx (ROCm build only) ───────────────────
+# Mirrors the kokoro-rocm Dockerfile pattern that is known to work:
+#   1. apt install migraphx    — system MIGraphX libs (libmigraphx_c.so etc.)
+#   2. rocm[libraries,devel]   — gfx1150-tuned HIP/ROCm Python libs
+#                                (provides libamdhip64.so.6, libhipblas.so.2…)
+#                                from the AMD staging index
+#   3. onnxruntime-migraphx    — from PyPI (no staging index needed)
+# onnxruntime-migraphx is NOT on the AMD staging index — install from PyPI.
 ARG GPU_SUPPORT
 RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
-        apt-get update && apt-get install -y --no-install-recommends \
-            migraphx \
-        && apt-get clean && rm -rf /var/lib/apt/lists/* && \
-        echo "==> Installing amdsmi from system ROCm..." && \
-        pip install --no-cache-dir /opt/rocm/share/amd_smi/ && \
-        echo "==> Baking ROCm lib paths into ldconfig..." && \
-        echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && \
-        echo "/opt/rocm/lib64" >> /etc/ld.so.conf.d/rocm.conf && \
-        ldconfig; \
-    fi
-
-# ── onnxruntime: MIGraphX build (ROCm) or CPU fallback ────────────────────────
-# onnxruntime-migraphx replaces the deprecated onnxruntime-rocm package.
-# It ships MIGraphXExecutionProvider and ROCMExecutionProvider.
-# It conflicts with the plain onnxruntime wheel — only one may be installed.
-ARG GPU_SUPPORT
-RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
-        echo "==> Installing onnxruntime-migraphx..." && \
-        pip install --no-cache-dir onnxruntime-migraphx \
-            --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1150/; \
+        echo "==> Installing system MIGraphX libraries via apt..." && \
+        apt-get update && apt-get install -y --no-install-recommends migraphx && \
+        apt-get clean && rm -rf /var/lib/apt/lists/* && \
+        echo "==> Installing gfx1150 ROCm Python libs from AMD staging..." && \
+        pip install --no-cache-dir \
+            --index-url https://rocm.nightlies.amd.com/v2-staging/gfx1150/ \
+            "rocm[libraries,devel]" && \
+        echo "==> Installing onnxruntime-migraphx from PyPI..." && \
+        pip uninstall -y onnxruntime onnxruntime-rocm 2>/dev/null || true && \
+        pip install --no-cache-dir onnxruntime-migraphx; \
     else \
         echo "==> CPU build: installing onnxruntime..." && \
         pip install --no-cache-dir onnxruntime; \

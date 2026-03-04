@@ -30,6 +30,11 @@ fi
 echo "==> Model ready: ${MODEL_LOCAL}"
 echo "==> Starting Qwen3-ASR vLLM server on :${PORT} ..."
 
+# Prevent vLLM/HF hub from trying to resolve the local model path as a
+# HuggingFace repo ID (causes 'Repo id must be in the form ...' retries).
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
 exec qwen-asr-serve "${MODEL_LOCAL}" \
     --host "${HOST}" \
     --port "${PORT}" \
