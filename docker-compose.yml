@@ -34,6 +34,10 @@ services:
       # MIOpen kernel tuning — see kokoro-rocm notes
       - MIOPEN_FIND_MODE=3
       - MIOPEN_FIND_ENFORCE=3
+      # Force vLLM V0 (synchronous AsyncLLMEngine) so the serve process stays
+      # alive as PID 1. V1 spawns the engine as a child and the parent exits,
+      # which Docker interprets as a container exit → restart loop.
+      - VLLM_USE_V1=0
 
     volumes:
       - ${QWEN_ASR_DATA_DIR:-./data}/models:/app/models
