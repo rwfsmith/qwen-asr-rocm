@@ -4,6 +4,7 @@
 # Build args:
 #   GPU_SUPPORT    rocm | cpu        (default: rocm)
 #   ROCM_IMAGE     ROCm base image   (default: rocm/dev-ubuntu-24.04:7.2-complete)
+#   VLLM_REF       vllm git ref to build from (default: main)
 #
 # GPU_SUPPORT=rocm install sequence:
 #   1. apt install migraphx          — system MIGraphX / HIP libs
@@ -11,19 +12,16 @@
 #   3. pip install torch             — from AMD gfx1150 staging only
 #   4. pip install triton            — AMD ROCm-compatible triton (PyPI)
 #   5. pip install flash-attn        — built with triton AMD backend, no CUDA kernels
-#   6. pip install vllm qwen-asr …   — everything else from PyPI
+#   6. Build vllm from source        — VLLM_TARGET_DEVICE=rocm avoids CUDA wheel
+#   7. pip install qwen-asr …        — everything else from PyPI
 #
-# flash-attn is built with FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE so it uses
-# triton kernels instead of CUDA device code, and is passed through to vLLM /
-# qwen-asr via VLLM_USE_TRITON_FLASH_ATTN at runtime.
-#
-# GPU_SUPPORT=cpu: CPU torch from pytorch.org, transformers backend.
-#
-# Model (Qwen/Qwen3-ASR-0.6B) is downloaded by entrypoint.sh on first start.
-# ─────────────────────────────────────────────────────────────────────────────
+# vLLM is built from source with VLLM_TARGET_DEVICE=rocm so it compiles its
+# ROCm custom ops (paged attention, etc.) rather than pulling CUDA wheels.
+# flash-attn is built with FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE.
 
 ARG GPU_SUPPORT=rocm
 ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:7.2-complete
+ARG VLLM_REF=main
 
 # Named base stages — Docker selects via FROM base-${GPU_SUPPORT}
 FROM ubuntu:24.04 AS base-cpu
@@ -94,19 +92,40 @@ RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
             pip install --no-cache-dir flash-attn --no-build-isolation; \
     fi
 
-# ── vLLM + qwen-asr: everything from PyPI ─────────────────────────────────────
-# Pin torch to the exact ROCm version already installed so pip cannot upgrade it
-# to a CUDA wheel when resolving vllm's dependencies.
-RUN TORCH_VER=$(pip show torch | grep ^Version | cut -d' ' -f2) && \
-    echo "==> Pinning torch==${TORCH_VER} to block CUDA upgrade during vllm install..." && \
-    pip install --no-cache-dir \
-        "torch==${TORCH_VER}" \
-        vllm \
+# ── vLLM: source build for ROCm, PyPI wheel for CPU ──────────────────────────
+# The PyPI vllm wheel only ships CUDA kernels.  For ROCm we must build from
+# source with VLLM_TARGET_DEVICE=rocm so it compiles HIP/ROCm paged-attention
+# ops and does not pull any NVIDIA CUDA packages.
+# VLLM_REF selects the git ref (tag, branch, or commit) to build.
+ARG GPU_SUPPORT
+ARG VLLM_REF
+RUN if [ "${GPU_SUPPORT}" = "rocm" ]; then \
+        TORCH_VER=$(pip show torch | grep ^Version | cut -d' ' -f2) && \
+        echo "==> Cloning vllm @ ${VLLM_REF} for ROCm source build..." && \
+        git clone --depth 1 --branch ${VLLM_REF} \
+            https://github.com/vllm-project/vllm /tmp/vllm && \
+        cd /tmp/vllm && \
+        echo "==> Installing vllm ROCm build requirements (pinning torch==${TORCH_VER})..." && \
+        ROCM_REQ=$([ -f requirements/rocm.txt ] && echo requirements/rocm.txt || echo requirements-rocm.txt) && \
+        pip install --no-cache-dir -r "${ROCM_REQ}" \
+            "torch==${TORCH_VER}" \
+            --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1150/ && \
+        echo "==> Building vllm with VLLM_TARGET_DEVICE=rocm..." && \
+        VLLM_TARGET_DEVICE=rocm \
+        MAX_JOBS=$(nproc) \
+            pip install --no-cache-dir --no-build-isolation -e . && \
+        rm -rf /tmp/vllm; \
+    else \
+        echo "==> CPU build: installing vllm from PyPI..." && \
+        pip install --no-cache-dir vllm; \
+    fi
+
+# ── qwen-asr and runtime deps ─────────────────────────────────────────────────
+RUN pip install --no-cache-dir \
         "qwen-asr>=0.0.6" \
         "huggingface_hub[cli]>=0.27" \
         "fastapi>=0.115" \
-        "uvicorn[standard]>=0.30" \
-        --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1150/
+        "uvicorn[standard]>=0.30"
 
 # ── App structure ─────────────────────────────────────────────────────────────
 RUN useradd -m -u 1001 appuser \
