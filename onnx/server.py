@@ -1,21 +1,27 @@
 """
-Qwen3-ASR ONNX inference server — onnxruntime direct (no optimum)
+Qwen3-ASR ONNX inference server — onnxruntime direct (no optimum, no torch)
 Serves OpenAI-compatible /v1/audio/transcriptions.
 
-Model:     andrewleech/qwen3-asr-0.6b-onnx-int8
-Processor: Qwen/Qwen3-ASR-0.6B  (feature extractor + tokenizer)
-Backend:   onnxruntime-rocm MIGraphXExecutionProvider (ROCm)
-           onnxruntime CPUExecutionProvider (CPU fallback)
+Model files (andrewleech/qwen3-asr-0.6b-onnx-int8):
+  encoder.onnx       mel [1,128,T] -> audio_features [1,N,1024]
+  decoder_init.onnx  input_embeds + position_ids -> logits + present_keys + present_values
+  decoder_step.onnx  input_embeds + pos + past_keys + past_values -> logits + present_*
+  embed_tokens.bin   [vocab, 1024] float16 token embedding matrix
 
-The ONNX export follows the Whisper/encoder-decoder convention used by
-optimum — we replicate the generate() loop directly so we have no
-dependency on optimum (which conflicts with the staging torch version).
+Inference pipeline (from andrewleech/qwen3-asr-onnx README):
+  1. Log-mel spectrogram (Whisper params) via librosa — pure numpy, no torch
+  2. encoder.onnx -> audio_features [1, N, 1024]
+  3. Build prompt token IDs with N <|audio_pad|> placeholders
+  4. Look up token embeddings from embed_tokens.bin
+  5. Replace <|audio_pad|> embeddings with audio_features[0]
+  6. decoder_init.onnx -> logits + KV cache
+  7. Greedy decode with decoder_step.onnx until EOS
 """
 
 from __future__ import annotations
 
-import glob
 import io
+import json
 import logging
 import os
 import time
@@ -29,7 +35,7 @@ import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
-from transformers import AutoProcessor
+from transformers import AutoTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -41,166 +47,137 @@ PROCESSOR_NAME = os.environ.get("PROCESSOR_NAME", "Qwen/Qwen3-ASR-0.6B")
 HOST           = os.environ.get("HOST", "0.0.0.0")
 PORT           = int(os.environ.get("PORT", "8001"))
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "448"))
-TARGET_SR      = 16_000   # Qwen3-ASR / Whisper encoder expects 16 kHz
+TARGET_SR      = 16_000
+
+# ── Special token IDs (from andrewleech/qwen3-asr-onnx src/prompt.py) ─────────
+ENDOFTEXT_TOKEN_ID  = 151643   # <|endoftext|>
+IM_START_TOKEN_ID   = 151644   # <|im_start|>
+IM_END_TOKEN_ID     = 151645   # <|im_end|>  — EOS
+AUDIO_START_TOKEN_ID = 151669  # <|audio_start|>
+AUDIO_END_TOKEN_ID  = 151670   # <|audio_end|>
+AUDIO_PAD_TOKEN_ID  = 151676   # <|audio_pad|> — replaced by encoder output
+EOS_TOKEN_IDS       = frozenset({ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID})
+
+# Fixed sub-word token IDs in Qwen3 tokenizer
+_SYSTEM_TOKEN  = 9125   # "system"
+_NEWLINE_TOKEN = 198    # "\n"
+
+# Encoder conv parameters (0.6B model)
+_CONV_WINDOW       = 100
+_TOKENS_PER_WINDOW = 13
 
 
-# ── Execution provider helpers ─────────────────────────────────────────────────
+# ── Mel spectrogram (Whisper-compatible, pure numpy/librosa) ───────────────────
+# Parameters: sr=16000, n_fft=400, hop=160, n_mels=128, fmin=0, fmax=8000
+# Slaney-normalized filterbank, log10, global-max normalization.
+
+_mel_filters: np.ndarray | None = None
+
+
+def _get_mel_filters() -> np.ndarray:
+    global _mel_filters
+    if _mel_filters is None:
+        _mel_filters = librosa.filters.mel(
+            sr=TARGET_SR, n_fft=400, n_mels=128,
+            fmin=0.0, fmax=8000.0, norm="slaney",
+        )
+    return _mel_filters
+
+
+def _log_mel_spectrogram(audio: np.ndarray) -> np.ndarray:
+    """Return log-mel spectrogram [1, 128, T] float32 (Whisper params)."""
+    # Power spectrogram via STFT with Hann window
+    stft = librosa.stft(audio, n_fft=400, hop_length=160,
+                        win_length=400, window="hann", center=True)
+    magnitudes = np.abs(stft[:, :-1]) ** 2  # drop last frame (parity with Whisper)
+
+    mel = _get_mel_filters() @ magnitudes        # [128, T]
+    log_spec = np.log10(np.maximum(mel, 1e-6))  # log10, clamp
+    # Per-mel-bin max normalization (Whisper formula)
+    log_spec = np.maximum(log_spec, log_spec.max(axis=-1, keepdims=True) - 8.0)
+    log_spec = (log_spec + 4.0) / 4.0
+    return log_spec[np.newaxis].astype(np.float32)  # [1, 128, T]
+
+
+# ── Audio-token count formula (mirrors _get_feat_extract_output_lengths) ───────
+
+def _get_audio_token_count(mel_T: int) -> int:
+    """Number of encoder output tokens for *mel_T* mel frames."""
+    def _conv_out(t: int) -> int:
+        return (t + 1) // 2
+
+    leave = mel_T % _CONV_WINDOW
+    t = _conv_out(_conv_out(_conv_out(leave)))
+    return (mel_T // _CONV_WINDOW) * _TOKENS_PER_WINDOW + t
+
+
+# ── Prompt construction ────────────────────────────────────────────────────────
+
+def _build_prompt_ids(
+    audio_token_count: int,
+    user_token: int,
+    assistant_token: int,
+) -> list[int]:
+    """
+    Prompt format (from README):
+      <|im_start|>system\\n<|im_end|>\\n
+      <|im_start|>user\\n<|audio_start|><|audio_pad|>*N<|audio_end|><|im_end|>\\n
+      <|im_start|>assistant\\n
+    """
+    return (
+        [IM_START_TOKEN_ID, _SYSTEM_TOKEN, _NEWLINE_TOKEN, IM_END_TOKEN_ID, _NEWLINE_TOKEN]
+        + [IM_START_TOKEN_ID, user_token, _NEWLINE_TOKEN]
+        + [AUDIO_START_TOKEN_ID]
+        + [AUDIO_PAD_TOKEN_ID] * audio_token_count
+        + [AUDIO_END_TOKEN_ID, IM_END_TOKEN_ID, _NEWLINE_TOKEN]
+        + [IM_START_TOKEN_ID, assistant_token, _NEWLINE_TOKEN]
+    )
+
+
+# ── ORT helpers ────────────────────────────────────────────────────────────────
+
 def _select_providers() -> list[str]:
-    """Return ORT execution providers in priority order."""
     available = ort.get_available_providers()
     log.info("Available ORT providers: %s", available)
-    ordered = []
-    for preferred in (
-        "MIGraphXExecutionProvider",
-        "ROCMExecutionProvider",
-        "CUDAExecutionProvider",
-        "CPUExecutionProvider",
-    ):
-        if preferred in available:
-            ordered.append(preferred)
-    if not ordered:
-        ordered = ["CPUExecutionProvider"]
+    ordered = [
+        p for p in (
+            "MIGraphXExecutionProvider",
+            "ROCMExecutionProvider",
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        )
+        if p in available
+    ] or ["CPUExecutionProvider"]
     log.info("Using ORT providers: %s", ordered)
     return ordered
-
-
-def _find_onnx(model_dir: str, pattern: str) -> str:
-    """Glob for a single ONNX file matching *pattern* inside model_dir."""
-    matches = glob.glob(str(Path(model_dir) / "**" / pattern), recursive=True)
-    if not matches:
-        raise FileNotFoundError(f"No ONNX file matching {pattern!r} in {model_dir}")
-    if len(matches) > 1:
-        log.warning("Multiple matches for %r, using %s", pattern, matches[0])
-    return matches[0]
 
 
 def _make_session(path: str, providers: list[str]) -> ort.InferenceSession:
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     sess = ort.InferenceSession(path, sess_options=opts, providers=providers)
-    log.info("Loaded ORT session: %s  providers=%s", Path(path).name, sess.get_providers())
+    log.info("Session loaded: %s  providers=%s", Path(path).name, sess.get_providers())
     return sess
 
 
-# ── Encoder / Decoder inference helpers ───────────────────────────────────────
-
-def _encode(
-    enc_sess: ort.InferenceSession,
-    input_features: np.ndarray,
-) -> np.ndarray:
-    """Run the encoder and return last_hidden_state (B, T, D)."""
-    feed = {"input_features": input_features.astype(np.float32)}
-    # Some exports also accept attention_mask; skip if not in session inputs
-    input_names = {inp.name for inp in enc_sess.get_inputs()}
-    if "attention_mask" in input_names:
-        feed["attention_mask"] = np.ones(input_features.shape[:2], dtype=np.int64)
-    outputs = enc_sess.run(None, feed)
-    return outputs[0]  # last_hidden_state
-
-
-def _decode(
-    dec_sess: ort.InferenceSession,
-    encoder_hidden_states: np.ndarray,
-    processor: AutoProcessor,
-    language: str | None,
-    max_new_tokens: int,
-) -> list[int]:
-    """
-    Autoregressive decoder loop.
-
-    Handles both:
-      • Separate decoder_model.onnx  (no use_cache_branch)
-      • Merged decoder_model_merged.onnx  (use_cache_branch: bool)
-    """
-    dec_inputs = {inp.name for inp in dec_sess.get_inputs()}
-    dec_outputs = {out.name for out in dec_sess.get_outputs()}
-    has_cache_branch = "use_cache_branch" in dec_inputs
-
-    # Build forced prefix tokens from the processor
-    forced_decoder_ids: list[int] = []
-    if hasattr(processor, "get_decoder_prompt_ids") and language:
-        pairs = processor.get_decoder_prompt_ids(language=language, task="transcribe")
-        for _, token_id in pairs:
-            forced_decoder_ids.append(token_id)
-
-    # Start token
-    bos = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
-    if bos is None or bos < 0:
-        bos = processor.tokenizer.bos_token_id or 0
-
-    generated: list[int] = [bos] + forced_decoder_ids
-    past_key_values: dict[str, np.ndarray] = {}
-
-    for step in range(max_new_tokens):
-        if step == 0 or not has_cache_branch:
-            # First step (or no merging): pass full sequence
-            input_ids = np.array([generated], dtype=np.int64)
-            use_cache = False
-        else:
-            # Subsequent steps: pass only the last token
-            input_ids = np.array([[generated[-1]]], dtype=np.int64)
-            use_cache = True
-
-        feed: dict[str, np.ndarray] = {
-            "input_ids": input_ids,
-            "encoder_hidden_states": encoder_hidden_states,
-        }
-
-        if has_cache_branch:
-            feed["use_cache_branch"] = np.array([use_cache], dtype=bool)
-
-        # Inject past key-values from previous iteration
-        for k, v in past_key_values.items():
-            if k in dec_inputs:
-                feed[k] = v
-
-        # Fill any remaining past_key_values with zeros on the first step
-        if step == 0:
-            for inp in dec_sess.get_inputs():
-                if inp.name.startswith("past_key_values") and inp.name not in feed:
-                    shape = [
-                        1 if (isinstance(d, str) or d == 0) else d
-                        for d in inp.shape
-                    ]
-                    feed[inp.name] = np.zeros(shape, dtype=np.float32)
-
-        results = dec_sess.run(None, feed)
-
-        # Collect present key-values for next iteration
-        past_key_values = {}
-        for out, val in zip(dec_sess.get_outputs(), results):
-            if out.name.startswith("present"):
-                # Map present_* → past_key_values.*  (common naming convention)
-                kv_name = out.name.replace("present", "past_key_values", 1)
-                past_key_values[kv_name] = val
-
-        # logits are always the first output
-        logits = results[0]  # (B, T, vocab)
-        next_token = int(np.argmax(logits[0, -1, :]))
-        generated.append(next_token)
-
-        # Stop at EOS
-        eos = processor.tokenizer.eos_token_id
-        if eos is not None and next_token == eos:
-            break
-
-    return generated
-
-
 # ── Global state ───────────────────────────────────────────────────────────────
-_enc_sess: ort.InferenceSession | None = None
-_dec_sess: ort.InferenceSession | None = None
-_processor: AutoProcessor | None = None
+_enc_sess:      ort.InferenceSession | None = None
+_dec_init_sess: ort.InferenceSession | None = None
+_dec_step_sess: ort.InferenceSession | None = None
+_tokenizer:     AutoTokenizer | None = None
+_embed_tokens:  np.ndarray | None = None   # [vocab, hidden] float16
+_user_token:    int = 872                  # resolved at startup
+_assistant_token: int = 77091             # resolved at startup
 
 
 def _model_local_path() -> str:
-    safe = MODEL_NAME.replace("/", "_")
-    return str(Path(MODEL_DIR) / safe)
+    return str(Path(MODEL_DIR) / MODEL_NAME.replace("/", "_"))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _enc_sess, _dec_sess, _processor
+    global _enc_sess, _dec_init_sess, _dec_step_sess
+    global _tokenizer, _embed_tokens, _user_token, _assistant_token
 
     model_local = _model_local_path()
     providers = _select_providers()
@@ -208,25 +185,42 @@ async def lifespan(app: FastAPI):
     log.info("Loading ONNX model from %s ...", model_local)
     t0 = time.monotonic()
 
-    enc_path = _find_onnx(model_local, "encoder_model*.onnx")
-    # Prefer merged decoder (has KV-cache support in one file), fall back to plain
-    try:
-        dec_path = _find_onnx(model_local, "decoder_model_merged.onnx")
-    except FileNotFoundError:
-        dec_path = _find_onnx(model_local, "decoder_model.onnx")
+    # ORT sessions
+    _enc_sess      = _make_session(str(Path(model_local) / "encoder.onnx"), providers)
+    _dec_init_sess = _make_session(str(Path(model_local) / "decoder_init.onnx"), providers)
+    _dec_step_sess = _make_session(str(Path(model_local) / "decoder_step.onnx"), providers)
 
-    _enc_sess = _make_session(enc_path, providers)
-    _dec_sess = _make_session(dec_path, providers)
+    # Token embedding matrix — [vocab, hidden] float16
+    embed_path = Path(model_local) / "embed_tokens.bin"
+    cfg_path   = Path(model_local) / "config.json"
+    cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+    vocab_size = cfg.get("vocab_size", 151936)
+    raw = np.fromfile(str(embed_path), dtype=np.float16)
+    hidden = raw.size // vocab_size
+    _embed_tokens = raw.reshape(vocab_size, hidden)
+    log.info("embed_tokens: shape=%s  dtype=%s", _embed_tokens.shape, _embed_tokens.dtype)
 
-    log.info("Loading processor from %s ...", PROCESSOR_NAME)
-    _processor = AutoProcessor.from_pretrained(PROCESSOR_NAME)
-    log.info("Model + processor ready in %.1f s", time.monotonic() - t0)
+    # Tokenizer — try model dir first (has tokenizer.json), fall back to HF hub
+    tok_dir = model_local if (Path(model_local) / "tokenizer.json").exists() else PROCESSOR_NAME
+    _tokenizer = AutoTokenizer.from_pretrained(tok_dir, trust_remote_code=True)
 
-    yield  # server is up
+    # Resolve "user" and "assistant" sub-word token IDs
+    u = _tokenizer.encode("user", add_special_tokens=False)
+    a = _tokenizer.encode("assistant", add_special_tokens=False)
+    if len(u) == 1:
+        _user_token = u[0]
+    if len(a) == 1:
+        _assistant_token = a[0]
+    log.info("user_token=%d  assistant_token=%d", _user_token, _assistant_token)
 
-    _enc_sess = None
-    _dec_sess = None
-    _processor = None
+    # Pre-compute mel filter bank
+    _get_mel_filters()
+
+    log.info("Ready in %.1f s", time.monotonic() - t0)
+    yield
+
+    _enc_sess = _dec_init_sess = _dec_step_sess = None
+    _tokenizer = _embed_tokens = None
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -240,10 +234,7 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models():
-    return {
-        "object": "list",
-        "data": [{"id": MODEL_NAME, "object": "model"}],
-    }
+    return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model"}]}
 
 
 @app.post("/v1/audio/transcriptions")
@@ -254,7 +245,9 @@ async def transcribe(
     response_format: str = Form(default="json"),
     temperature: float = Form(default=0.0),
 ):
-    if _enc_sess is None or _dec_sess is None or _processor is None:
+    if any(x is None for x in (
+        _enc_sess, _dec_init_sess, _dec_step_sess, _tokenizer, _embed_tokens
+    )):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     # ── Read and decode audio ──────────────────────────────────────────────────
@@ -267,37 +260,71 @@ async def transcribe(
     if audio_np.ndim > 1:
         audio_np = audio_np.mean(axis=1)
     audio_np = audio_np.astype(np.float32)
-
     if sr != TARGET_SR:
         audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=TARGET_SR)
+    audio_dur = len(audio_np) / TARGET_SR
 
-    # ── Feature extraction ────────────────────────────────────────────────────
     t0 = time.monotonic()
-    inputs = _processor(audio_np, sampling_rate=TARGET_SR, return_tensors="np")
-    input_features: np.ndarray = inputs["input_features"]  # (1, 128, T)
 
-    # ── Encoder → Decoder ─────────────────────────────────────────────────────
-    encoder_hidden_states = _encode(_enc_sess, input_features)
-    token_ids = _decode(
-        _dec_sess,
-        encoder_hidden_states,
-        _processor,
-        language=language,
-        max_new_tokens=MAX_NEW_TOKENS,
+    # ── 1. Log-mel spectrogram ────────────────────────────────────────────────
+    mel = _log_mel_spectrogram(audio_np)   # [1, 128, T]
+    mel_T = mel.shape[2]
+
+    # ── 2. Encoder ────────────────────────────────────────────────────────────
+    audio_features = _enc_sess.run(["audio_features"], {"mel": mel})[0]  # [1, N, 1024]
+    audio_token_count = audio_features.shape[1]
+    log.info("Encoder: mel_T=%d  audio_tokens=%d", mel_T, audio_token_count)
+
+    # ── 3. Prompt token IDs ───────────────────────────────────────────────────
+    prompt_ids = _build_prompt_ids(audio_token_count, _user_token, _assistant_token)
+    seq_len = len(prompt_ids)
+
+    # ── 4. Embed prompt tokens ────────────────────────────────────────────────
+    ids_arr = np.array(prompt_ids, dtype=np.int64)
+    input_embeds = _embed_tokens[ids_arr].astype(np.float32)  # [seq_len, hidden]
+
+    # ── 5. Replace <|audio_pad|> slots with encoder output ───────────────────
+    audio_start_idx = prompt_ids.index(AUDIO_PAD_TOKEN_ID)
+    audio_end_idx   = audio_start_idx + audio_token_count
+    input_embeds[audio_start_idx:audio_end_idx] = audio_features[0].astype(np.float32)
+
+    input_embeds = input_embeds[np.newaxis]          # [1, seq_len, hidden]
+    position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis]  # [1, seq_len]
+
+    # ── 6. Decoder prefill ────────────────────────────────────────────────────
+    logits, present_keys, present_values = _dec_init_sess.run(
+        ["logits", "present_keys", "present_values"],
+        {"input_embeds": input_embeds, "position_ids": position_ids},
     )
+    next_token = int(np.argmax(logits[0, -1, :]))
+    output_tokens = [next_token]
 
-    text = _processor.tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+    # ── 7. Autoregressive decode ───────────────────────────────────────────────
+    pos = seq_len
+    for _ in range(MAX_NEW_TOKENS - 1):
+        if next_token in EOS_TOKEN_IDS:
+            break
+        token_embed = _embed_tokens[next_token].astype(np.float32)[np.newaxis, np.newaxis, :]
+        step_pos = np.array([[pos]], dtype=np.int64)
+        logits, present_keys, present_values = _dec_step_sess.run(
+            ["logits", "present_keys", "present_values"],
+            {
+                "input_embeds": token_embed,
+                "position_ids": step_pos,
+                "past_keys":    present_keys,
+                "past_values":  present_values,
+            },
+        )
+        next_token = int(np.argmax(logits[0, -1, :]))
+        output_tokens.append(next_token)
+        pos += 1
+
+    text = _tokenizer.decode(output_tokens, skip_special_tokens=True).strip()
     elapsed = time.monotonic() - t0
-
-    log.info(
-        "Transcribed %.1f s of audio in %.2f s: %r",
-        len(audio_np) / TARGET_SR,
-        elapsed,
-        text,
-    )
+    log.info("Transcribed %.1f s in %.2f s: %r", audio_dur, elapsed, text)
 
     if response_format == "verbose_json":
-        return JSONResponse({"text": text, "duration": len(audio_np) / TARGET_SR})
+        return JSONResponse({"text": text, "duration": audio_dur})
     return JSONResponse({"text": text})
 
 
