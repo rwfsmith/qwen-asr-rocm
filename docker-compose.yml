@@ -12,6 +12,7 @@ services:
     restart: unless-stopped
 
     user: root
+    shm_size: 4gb   # vLLM uses /dev/shm for multiprocessing worker communication
 
     ports:
       - "8000:8000"
