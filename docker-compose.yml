@@ -34,10 +34,16 @@ services:
       # MIOpen kernel tuning — see kokoro-rocm notes
       - MIOPEN_FIND_MODE=3
       - MIOPEN_FIND_ENFORCE=3
-      # Force vLLM V0 (synchronous AsyncLLMEngine) so the serve process stays
-      # alive as PID 1. V1 spawns the engine as a child and the parent exits,
-      # which Docker interprets as a container exit → restart loop.
+      # VLLM_USE_V1=0 is not recognised by this vLLM build (logged as unknown);
+      # kept here in case of a future vLLM upgrade that supports it.
       - VLLM_USE_V1=0
+      # vLLM V1 spawns EngineCore workers with multiprocessing; the default
+      # 'spawn' method re-initialises HIP/ROCm libs in the child and silently
+      # fails on ROCm, causing a clean sys.exit(0) after model config.
+      # 'fork' inherits the already-initialised ROCm context instead.
+      - VLLM_WORKER_MULTIPROC_METHOD=fork
+      # Debug logging to diagnose GPU init / worker spawn failures.
+      - VLLM_LOGGING_LEVEL=DEBUG
 
     volumes:
       - ${QWEN_ASR_DATA_DIR:-./data}/models:/app/models
