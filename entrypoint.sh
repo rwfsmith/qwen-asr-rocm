@@ -35,7 +35,11 @@ echo "==> Starting Qwen3-ASR vLLM server on :${PORT} ..."
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-exec qwen-asr-serve "${MODEL_LOCAL}" \
+# Use python -m directly to ensure the vLLM API server is PID 1 in the
+# container (qwen-asr-serve / vllm CLI V1 spawns a child APIServer then the
+# parent exits cleanly, causing Docker to restart the container).
+exec python -m vllm.entrypoints.openai.api_server \
+    --model "${MODEL_LOCAL}" \
     --host "${HOST}" \
     --port "${PORT}" \
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
