@@ -1,0 +1,91 @@
+# truenas-compose.yml – Qwen3-ASR vLLM API + Wyoming proxy for TrueNAS SCALE
+#
+# Run from TrueNAS shell (System Settings → Shell or SSH):
+#
+#   cd /mnt/<pool>/<dataset>/qwen-asr
+#   git clone https://github.com/rwfsmith/llm_assistant . 2>/dev/null || true
+#   cd docker/qwen-asr-rocm
+#
+# Then set env vars and start:
+#   export VIDEO_GID=$(getent group video | cut -d: -f3)
+#   export RENDER_GID=$(getent group render | cut -d: -f3)
+#   export QWEN_ASR_DATA_DIR=/mnt/tank/apps/qwen-asr/data
+#   sudo -E mkdir -p "$QWEN_ASR_DATA_DIR"/{models,miopen-cache,hf-cache}
+#   docker compose -f truenas-compose.yml up -d --build
+#
+# The model (Qwen3-ASR-0.6B, ~1.2 GB) is downloaded on first start if
+# not already in the cache volume.
+#
+# Add to Home Assistant:
+#   Settings → Devices & Services → Add Integration → Wyoming Protocol
+#   Host: <truenas-ip>   Port: 10300
+
+name: qwen-asr-rocm
+
+x-data-dir: &data-dir ${QWEN_ASR_DATA_DIR:-./data}
+
+services:
+  qwen-asr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GPU_SUPPORT: "rocm"
+
+    container_name: qwen-asr-rocm
+    restart: unless-stopped
+
+    user: root
+
+    ports:
+      - "8000:8000"
+
+    # --- AMD GPU passthrough ---
+    devices:
+      - /dev/dri
+      - /dev/kfd
+
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-109}"
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MODEL_NAME=Qwen/Qwen3-ASR-0.6B
+      - GPU_MEMORY_UTILIZATION=0.7
+      - MAX_NEW_TOKENS=1024
+      # MIOpen kernel tuning — exhaustive search on first run, caches to volume.
+      # After first successful startup, consider switching to MIOPEN_FIND_MODE=2.
+      - MIOPEN_FIND_MODE=3
+      - MIOPEN_FIND_ENFORCE=3
+
+    volumes:
+      - ${QWEN_ASR_DATA_DIR:-./data}/models:/app/models
+      - ${QWEN_ASR_DATA_DIR:-./data}/miopen-cache:/root/.cache/miopen
+      - ${QWEN_ASR_DATA_DIR:-./data}/hf-cache:/root/.cache/huggingface
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  qwen-asr-wyoming:
+    build:
+      context: ./wyoming
+      dockerfile: Dockerfile
+
+    container_name: qwen-asr-wyoming
+    restart: unless-stopped
+
+    ports:
+      - "10300:10300"
+
+    depends_on:
+      qwen-asr:
+        condition: service_healthy
+
+    command: >
+      --asr-url http://qwen-asr:8000
+      --model Qwen/Qwen3-ASR-0.6B

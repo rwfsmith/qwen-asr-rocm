@@ -1,0 +1,67 @@
+name: qwen-asr-rocm
+
+services:
+  qwen-asr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GPU_SUPPORT: "${GPU_SUPPORT:-rocm}"
+
+    container_name: qwen-asr-rocm
+    restart: unless-stopped
+
+    user: root
+
+    ports:
+      - "8000:8000"
+
+    # --- AMD GPU passthrough ---
+    devices:
+      - /dev/dri
+      - /dev/kfd
+
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-109}"
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MODEL_NAME=${MODEL_NAME:-Qwen/Qwen3-ASR-0.6B}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.7}
+      - MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
+      # MIOpen kernel tuning — see kokoro-rocm notes
+      - MIOPEN_FIND_MODE=3
+      - MIOPEN_FIND_ENFORCE=3
+
+    volumes:
+      - ${QWEN_ASR_DATA_DIR:-./data}/models:/app/models
+      - ${QWEN_ASR_DATA_DIR:-./data}/miopen-cache:/root/.cache/miopen
+      - ${QWEN_ASR_DATA_DIR:-./data}/hf-cache:/root/.cache/huggingface
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  qwen-asr-wyoming:
+    build:
+      context: ./wyoming
+      dockerfile: Dockerfile
+
+    container_name: qwen-asr-wyoming
+    restart: unless-stopped
+
+    ports:
+      - "10300:10300"
+
+    depends_on:
+      qwen-asr:
+        condition: service_healthy
+
+    command: >
+      --asr-url http://qwen-asr:8000
+      --model ${MODEL_NAME:-Qwen/Qwen3-ASR-0.6B}
+      --language ${ASR_LANGUAGE:-}
