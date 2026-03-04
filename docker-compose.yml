@@ -34,15 +34,11 @@ services:
       # MIOpen kernel tuning — see kokoro-rocm notes
       - MIOPEN_FIND_MODE=3
       - MIOPEN_FIND_ENFORCE=3
-      # VLLM_USE_V1=0 is not recognised by this vLLM build (logged as unknown);
-      # kept here in case of a future vLLM upgrade that supports it.
-      - VLLM_USE_V1=0
-      # vLLM V1 spawns EngineCore workers with multiprocessing; the default
-      # 'spawn' method re-initialises HIP/ROCm libs in the child and silently
-      # fails on ROCm, causing a clean sys.exit(0) after model config.
-      # 'fork' inherits the already-initialised ROCm context instead.
-      - VLLM_WORKER_MULTIPROC_METHOD=fork
-      # Debug logging to diagnose GPU init / worker spawn failures.
+      # HIP/ROCm segfaults when initialised a second time in a child process
+      # (gfx1150).  Disable V1 multi-processing so EngineCore runs in the
+      # same process as APIServer — no child subprocess, no second HIP init.
+      - VLLM_ENABLE_V1_MULTIPROCESSING=0
+      # Debug logging — remove once stable.
       - VLLM_LOGGING_LEVEL=DEBUG
 
     volumes:
