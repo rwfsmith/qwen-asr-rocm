@@ -52,6 +52,7 @@ services:
 
     environment:
       - PYTHONUNBUFFERED=1
+      - PYTHONFAULTHANDLER=1
       - MODEL_NAME=Qwen/Qwen3-ASR-0.6B
       - GPU_MEMORY_UTILIZATION=0.7
       - MAX_NEW_TOKENS=1024
